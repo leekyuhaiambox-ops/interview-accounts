@@ -1,0 +1,39 @@
+# Render Blueprint — deploys the accounts API + a free Postgres database.
+# Push this folder (app.py, requirements.txt, render.yaml) to a GitHub repo, then
+# in Render: New → Blueprint → pick the repo. Render reads this file and creates
+# both services. Fill the sync:false vars in the dashboard after first deploy.
+services:
+  - type: web
+    name: interview-accounts
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    healthCheckPath: /healthz
+    envVars:
+      - key: JWT_SECRET
+        generateValue: true            # Render generates a strong secret
+      - key: ADMIN_KEY
+        generateValue: true            # for GET /api/admin/members (X-Admin-Key)
+      - key: CORS_ORIGINS
+        value: https://geoinfomatic.pythonanywhere.com
+      - key: GOOGLE_CLIENT_ID
+        sync: false                    # paste from Google Cloud Console
+      - key: SMTP_HOST
+        sync: false                    # optional (email 인증번호). e.g. smtp.gmail.com
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        sync: false                    # your email
+      - key: SMTP_PASS
+        sync: false                    # gmail app password
+      - key: SMTP_FROM
+        sync: false                    # usually same as SMTP_USER
+      - key: DATABASE_URL
+        fromDatabase:
+          name: interview-accounts-db
+          property: connectionString
+
+databases:
+  - name: interview-accounts-db
+    plan: free
