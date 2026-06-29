@@ -46,6 +46,10 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 JWT_SECRET = os.environ.get("JWT_SECRET", "dev-secret-change-me")
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
+# Logged-in members whose email is here can use /api/admin/* with just their
+# session token (no separate ADMIN_KEY) — so the owner who signed in with Google
+# sees the dashboard without pasting a key.
+ADMIN_EMAILS = {e.strip().lower() for e in os.environ.get("ADMIN_EMAILS", "").split(",") if e.strip()}
 CORS_ORIGINS = [o.strip() for o in os.environ.get(
     "CORS_ORIGINS", "http://localhost:8771,https://geoinfomatic.pythonanywhere.com"
 ).split(",") if o.strip()]
@@ -267,9 +271,17 @@ def me():
     return jsonify(user_json(u))
 
 
+def _is_admin():
+    # (a) shared admin key header, or (b) a logged-in member on the email allowlist
+    if ADMIN_KEY and request.headers.get("X-Admin-Key") == ADMIN_KEY:
+        return True
+    u = current_user()
+    return bool(u and u.email and u.email.lower() in ADMIN_EMAILS)
+
+
 @app.route("/api/admin/members")
 def admin_members():
-    if not ADMIN_KEY or request.headers.get("X-Admin-Key") != ADMIN_KEY:
+    if not _is_admin():
         return jsonify({"error": "forbidden"}), 403
     s = db()
     rows = s.scalars(select(User).order_by(User.created_at.desc())).all()
