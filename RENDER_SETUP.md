@@ -56,10 +56,19 @@ API입니다. Render(무료)에 올리고, 프런트(현재 PythonAnywhere의 �
 
 ---
 
+## Ko-fi 결제 → Pro 자동 반영 (웹훅)
+1. https://ko-fi.com/manage/webhooks 접속
+2. **Webhook URL**: `https://interview-accounts.onrender.com/api/webhook/kofi`
+3. 같은 페이지의 **Verification Token** 복사
+4. Render → interview-accounts → Environment → `KOFI_VERIFICATION_TOKEN` = 복사한 값 → 저장(재배포)
+- 멤버십 결제가 오면 그 이메일 회원이 자동 **Pro(35일)**, 매달 갱신 때마다 연장. Ko-fi엔 해지 웹훅이 없어 **만료형** — 해지하면 35일 뒤 자동 Free.
+- admin.html 플랜 토글(`/api/admin/set-plan`)의 수동 변경은 **영구**(만료 없음).
+- Ko-fi "Send Test" 버튼은 Donation 형식이라 `ignored` 응답이 정상(실결제/테스트 티어로 검증).
+- ⚠️ 구매자가 **로그인과 같은 이메일**로 결제해야 자동 매칭(요금제 페이지에 안내됨). 불일치 시 admin에 `kofi` 경로 stub가 보임 → 수동 조정.
+
 ## 회원 관리 (당신용)
-- 가입자 목록: `GET https://<render-url>/api/admin/members` 헤더 `X-Admin-Key: <ADMIN_KEY>`
-  (ADMIN_KEY는 Render Environment에 자동 생성된 값). 브라우저 확장/포스트맨/터미널로 조회.
-- 원하면 제가 **간단한 관리자 웹페이지**(가입자 표·검색·plan 변경)도 만들어 드립니다.
+- **관리자 페이지(권장)**: https://geoinfomatic.pythonanywhere.com/interview/admin.html — 관리자 구글 로그인만으로 가입자 표 + 플랜 Free↔Pro 토글.
+- API 직접: `GET /api/admin/members`, `POST /api/admin/set-plan {email, plan}` — 헤더 `X-Admin-Key` 또는 관리자 세션 Bearer.
 
 ## API 요약
 | 엔드포인트 | 용도 |
