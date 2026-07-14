@@ -28,6 +28,7 @@ Env vars (set in Render dashboard):
 import datetime as dt
 import hashlib
 import hmac
+import json
 import os
 import random
 import smtplib
@@ -44,12 +45,24 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 
 # ---------------------------------------------------------------- config
 JWT_SECRET = os.environ.get("JWT_SECRET", "dev-secret-change-me")
+# Fail closed in production: on Render (RENDER env var is always set there) a
+# missing JWT_SECRET would let anyone forge admin tokens with the known dev
+# default — refuse to boot instead.
+if os.environ.get("RENDER") and not os.environ.get("JWT_SECRET"):
+    raise RuntimeError("JWT_SECRET must be set in production")
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
+# Optional: restrict which Ko-fi membership tiers grant Pro (comma-separated
+# tier names). Empty = any subscription payment counts (fine with one tier).
+KOFI_PRO_TIERS = {t.strip() for t in os.environ.get("KOFI_PRO_TIERS", "").split(",") if t.strip()}
 # Logged-in members whose email is here can use /api/admin/* with just their
 # session token (no separate ADMIN_KEY) — so the owner who signed in with Google
 # sees the dashboard without pasting a key.
 ADMIN_EMAILS = {e.strip().lower() for e in os.environ.get("ADMIN_EMAILS", "").split(",") if e.strip()}
+# Ko-fi webhook (ko-fi.com/manage/webhooks): paste that page's Verification Token
+# here so /api/webhook/kofi can auto-activate Pro on membership payments.
+# Fail-closed: with no token set the endpoint refuses everything.
+KOFI_TOKEN = os.environ.get("KOFI_VERIFICATION_TOKEN", "")
 CORS_ORIGINS = [o.strip() for o in os.environ.get(
     "CORS_ORIGINS", "http://localhost:8771,https://geoinfomatic.pythonanywhere.com"
 ).split(",") if o.strip()]
@@ -83,7 +96,8 @@ class User(Base):
     pw_hash = Column(String(128))
     email_verified = Column(Integer, default=0)
     plan = Column(String(16), default="free")
-    provider = Column(String(16), default="email")  # email | google
+    pro_until = Column(DateTime)                   # Ko-fi grants expire (no cancel webhook); NULL = permanent/manual
+    provider = Column(String(16), default="email")  # email | google | kofi
     created_at = Column(DateTime, server_default=func.now())
     last_login = Column(DateTime)
 
@@ -98,6 +112,20 @@ class Code(Base):
 
 
 Base.metadata.create_all(engine)
+# Lightweight migration: create_all never ALTERs existing tables, so add the
+# pro_until column in place on already-deployed DBs (no-op once present).
+try:
+    with engine.begin() as _c:
+        _c.exec_driver_sql("ALTER TABLE users ADD COLUMN pro_until TIMESTAMP")
+except Exception:
+    pass  # column already exists (or dialect quirk) — model stays the source of truth
+
+
+def effective_plan(u):
+    """Stored plan, downgraded when a Ko-fi grant has lapsed (NULL = permanent)."""
+    if u.plan == "pro" and u.pro_until and u.pro_until < dt.datetime.utcnow():
+        return "free"
+    return u.plan or "free"
 
 app = Flask(__name__)
 CORS(app, origins=CORS_ORIGINS, supports_credentials=False)
@@ -148,7 +176,7 @@ def login_required(fn):
 
 
 def user_json(u, token=None):
-    out = {"email": u.email, "name": u.name, "plan": u.plan, "provider": u.provider}
+    out = {"email": u.email, "name": u.name, "plan": effective_plan(u), "provider": u.provider}
     if token:
         out["token"] = token
     return out
@@ -176,10 +204,14 @@ def _valid_email(e):
 
 
 # ---------------------------------------------------------------- routes
+APP_VERSION = "2026-06-30-kofi-webhook"
+
+
 @app.route("/")
 @app.route("/healthz")
 def health():
-    return jsonify({"ok": True, "email_enabled": EMAIL_ENABLED, "google": bool(GOOGLE_CLIENT_ID)})
+    return jsonify({"ok": True, "email_enabled": EMAIL_ENABLED, "google": bool(GOOGLE_CLIENT_ID),
+                    "kofi_webhook": bool(KOFI_TOKEN), "v": APP_VERSION})
 
 
 @app.route("/api/auth/google", methods=["POST"])
@@ -273,7 +305,8 @@ def me():
 
 def _is_admin():
     # (a) shared admin key header, or (b) a logged-in member on the email allowlist
-    if ADMIN_KEY and request.headers.get("X-Admin-Key") == ADMIN_KEY:
+    if ADMIN_KEY and hmac.compare_digest(
+            request.headers.get("X-Admin-Key", "").encode("utf-8"), ADMIN_KEY.encode("utf-8")):
         return True
     u = current_user()
     return bool(u and u.email and u.email.lower() in ADMIN_EMAILS)
@@ -286,11 +319,90 @@ def admin_members():
     s = db()
     rows = s.scalars(select(User).order_by(User.created_at.desc())).all()
     return jsonify({"count": len(rows), "members": [{
-        "id": u.id, "email": u.email, "name": u.name, "plan": u.plan,
+        "id": u.id, "email": u.email, "name": u.name, "plan": effective_plan(u),
+        "pro_until": u.pro_until.isoformat() if u.pro_until else None,
         "provider": u.provider, "verified": bool(u.email_verified),
         "created_at": u.created_at.isoformat() if u.created_at else None,
         "last_login": u.last_login.isoformat() if u.last_login else None,
     } for u in rows]})
+
+
+@app.route("/api/admin/set-plan", methods=["POST"])
+def admin_set_plan():
+    """Body: {email, plan: free|pro}. Manually flip a member's plan (admin only)."""
+    if not _is_admin():
+        return jsonify({"error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    plan = (data.get("plan") or "").strip().lower()
+    if plan not in ("free", "pro"):
+        return jsonify({"error": "plan must be 'free' or 'pro'"}), 400
+    s = db()
+    u = s.scalar(select(User).where(User.email == email))
+    if not u:
+        return jsonify({"error": "해당 이메일의 회원이 없습니다."}), 404
+    u.plan = plan
+    u.pro_until = None   # manual grants/downgrades are permanent (no auto-expiry)
+    s.commit()
+    return jsonify({"ok": True, "email": u.email, "plan": u.plan})
+
+
+@app.route("/api/webhook/kofi", methods=["POST"])
+def kofi_webhook():
+    """Ko-fi payment webhook → auto-activate Pro.
+
+    Ko-fi POSTs application/x-www-form-urlencoded with a 'data' field holding
+    JSON (see ko-fi.com/manage/webhooks). We verify its verification_token
+    against KOFI_VERIFICATION_TOKEN, then on any membership/subscription
+    payment set plan='pro' for the member whose email matches the Ko-fi
+    payment email (creating a stub member if they haven't logged in yet, so
+    the upgrade is waiting for them when they do).
+    """
+    if not KOFI_TOKEN:
+        return jsonify({"error": "webhook disabled (no KOFI_VERIFICATION_TOKEN)"}), 503
+    try:
+        payload = json.loads(request.form.get("data", "") or "{}")
+    except Exception:
+        return jsonify({"error": "bad payload"}), 400
+    if not isinstance(payload, dict):
+        return jsonify({"error": "bad payload"}), 400
+    tok = str(payload.get("verification_token", ""))
+    if not hmac.compare_digest(tok.encode("utf-8"), KOFI_TOKEN.encode("utf-8")):
+        return jsonify({"error": "forbidden"}), 403
+    email = (payload.get("email") or "").strip().lower()
+    typ = payload.get("type") or ""
+    tier = payload.get("tier_name")
+    is_sub = bool(payload.get("is_subscription_payment")) or typ == "Subscription"
+    app.logger.info("kofi webhook: type=%s email=%s tier=%s msg=%s",
+                    typ, email, tier, payload.get("message_id"))
+    if not email or not is_sub or not _valid_email(email):
+        return jsonify({"ok": True, "ignored": typ or "no email"})
+    if KOFI_PRO_TIERS and (tier or "") not in KOFI_PRO_TIERS:
+        return jsonify({"ok": True, "ignored": f"tier '{tier}' not in allowlist"})
+    # Ko-fi has NO cancel/refund webhook, so grants must expire: each monthly
+    # renewal re-arrives here and pushes pro_until forward again. Absolute
+    # (now+35d), not additive — replays/retries stay idempotent.
+    until = dt.datetime.utcnow() + dt.timedelta(days=35)
+
+    def _grant(sess):
+        u = sess.scalar(select(User).where(User.email == email))
+        if not u:
+            u = User(email=email, name=payload.get("from_name"), provider="kofi",
+                     email_verified=1, plan="pro", pro_until=until)
+            sess.add(u)
+        else:
+            u.plan = "pro"
+            u.pro_until = until
+        sess.commit()
+
+    s = db()
+    try:
+        _grant(s)
+    except Exception:
+        # unique-email race (webhook retry vs signup): retry once on the update path
+        s.rollback()
+        _grant(s)
+    return jsonify({"ok": True, "email": email, "plan": "pro", "pro_until": until.isoformat()})
 
 
 if __name__ == "__main__":

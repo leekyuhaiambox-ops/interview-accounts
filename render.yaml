@@ -19,6 +19,8 @@ services:
         value: https://geoinfomatic.pythonanywhere.com
       - key: GOOGLE_CLIENT_ID
         sync: false                    # paste from Google Cloud Console
+      - key: KOFI_VERIFICATION_TOKEN
+        sync: false                    # ko-fi.com/manage/webhooks Verification Token (자동 Pro 반영)
       - key: SMTP_HOST
         sync: false                    # optional (email 인증번호). e.g. smtp.gmail.com
       - key: SMTP_PORT
